@@ -27,9 +27,10 @@ DEFAULT_ALPHA = 0.2
 DEFAULT_BATCH_SIZE = 64
 DEFAULT_LR_ACTOR = 3e-4
 DEFAULT_LR_CRITIC = 3e-4
+DEFAULT_LR_ALPHA = 3e-4
 DEFAULT_REPLAY_SIZE = 100_000
 DEFAULT_WARMUP_STEPS = 1_000
-DEFAULT_MAX_STEPS = 200_000
+DEFAULT_MAX_STEPS = 3_000
 DEFAULT_EVAL_INTERVAL = 5_000
 DEFAULT_UPDATES_PER_STEP = 1
 LOG_STD_MIN = -20
@@ -165,11 +166,12 @@ def evaluate_policy(env: gym.Env, policy: PolicyNetwork, device: torch.device, e
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train SAC agent on Pendulum-v1 without PTAN")
     parser.add_argument("--gamma", type=float, default=DEFAULT_GAMMA, help="Discount factor")
-    parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA, help="Entropy coefficient")
+    parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA, help="Initial entropy coefficient (auto-tuned)")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Batch size for updates")
     parser.add_argument("--lr-actor", type=float, default=DEFAULT_LR_ACTOR, help="Learning rate for the policy")
     parser.add_argument("--lr-critic", type=float, default=DEFAULT_LR_CRITIC, help="Learning rate for critics")
     parser.add_argument("--replay-size", type=int, default=DEFAULT_REPLAY_SIZE, help="Replay buffer capacity")
+    parser.add_argument("--lr-alpha", type=float, default=DEFAULT_LR_ALPHA, help="Learning rate for entropy temperature")
     parser.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS, help="Steps collected before training")
     parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="Total interaction steps")
     parser.add_argument("--eval-interval", type=int, default=DEFAULT_EVAL_INTERVAL, help="Steps between evaluations")
@@ -206,6 +208,9 @@ def main() -> None:
     actor_optimizer = torch.optim.Adam(policy_net.parameters(), lr=args.lr_actor)
     value_optimizer = torch.optim.Adam(value_net.parameters(), lr=args.lr_critic)
     q_optimizer = torch.optim.Adam(twin_q_net.parameters(), lr=args.lr_critic)
+    log_alpha = torch.tensor(np.log(max(args.alpha, 1e-6)), dtype=torch.float32, device=device, requires_grad=True)
+    alpha_optimizer = torch.optim.Adam([log_alpha], lr=args.lr_alpha)
+    target_entropy = -float(act_dim)
 
     # Step 13: Initialize replay buffer and logging utilities
     replay_buffer = ReplayBuffer(args.replay_size)
@@ -255,29 +260,38 @@ def main() -> None:
                 q_optimizer.step()
 
                 # Step 15b: Update the state-value network to match the soft value target
+                alpha = log_alpha.exp()
+                alpha_detached = alpha.detach()
                 sampled_actions_v, log_prob_v, _ = policy_net.sample(states_v)
                 q1_pi_v, q2_pi_v = twin_q_net(states_v, sampled_actions_v)
-                soft_value_target = torch.min(q1_pi_v, q2_pi_v) - args.alpha * log_prob_v
+                min_q_pi_v = torch.min(q1_pi_v, q2_pi_v)
+                soft_value_target = (min_q_pi_v - alpha_detached * log_prob_v).detach()
                 value_v = value_net(states_v)
-                value_loss = F.mse_loss(value_v, soft_value_target.detach())
+                value_loss = F.mse_loss(value_v, soft_value_target)
                 value_optimizer.zero_grad()
                 value_loss.backward()
                 value_optimizer.step()
 
                 # Step 15c: Update the policy to maximize expected Q while respecting entropy
-                sampled_actions_v, log_prob_v, _ = policy_net.sample(states_v)
-                q1_pi_v, q2_pi_v = twin_q_net(states_v, sampled_actions_v)
-                policy_loss = (args.alpha * log_prob_v - torch.min(q1_pi_v, q2_pi_v)).mean()
+                policy_loss = (alpha_detached * log_prob_v - min_q_pi_v).mean()
                 actor_optimizer.zero_grad()
                 policy_loss.backward()
                 actor_optimizer.step()
 
-                # Step 15d: Keep the target value network in sync
+                # Step 15d: Adjust entropy temperature to match target entropy automatically
+                alpha_loss = -(log_alpha * (log_prob_v.detach() + target_entropy)).mean()
+                alpha_optimizer.zero_grad()
+                alpha_loss.backward()
+                alpha_optimizer.step()
+
+                # Step 15e: Keep the target value network in sync
                 soft_update(target_value_net, value_net, args.tau)
 
             writer.add_scalar("loss/q", q_loss.item(), step_idx)
             writer.add_scalar("loss/value", value_loss.item(), step_idx)
             writer.add_scalar("loss/policy", policy_loss.item(), step_idx)
+            writer.add_scalar("loss/alpha", alpha_loss.item(), step_idx)
+            writer.add_scalar("alpha/value", log_alpha.exp().item(), step_idx)
             if log_prob is not None:
                 writer.add_scalar("policy/log_prob", log_prob, step_idx)
 
