@@ -1,0 +1,16 @@
+# PPO强化学习所需依赖包
+# 核心机器学习库
+torch>=1.9.0
+torchvision>=0.10.0
+numpy>=1.21.0
+
+# 强化学习环境
+gymnasium>=0.28.0
+gymnasium[classic_control]>=0.28.0
+
+# 可视化和日志
+tensorboard>=2.8.0
+matplotlib>=3.5.0
+
+# 其他工具
+tqdm>=4.62.0
