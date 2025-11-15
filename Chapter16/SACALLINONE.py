@@ -2,8 +2,7 @@
 """Single-file Soft Actor-Critic implementation without PTAN.
 
 The script trains an SAC agent on the Pendulum-v1 environment from Gymnasium.
-Networks, replay buffer, and the full training loop live inside this module so
-that it can be run standalone.
+This follows the standard SAC algorithm with episode-based training loop.
 """
 
 # Step 1: Standard library imports
@@ -24,14 +23,15 @@ from torch.utils.tensorboard import SummaryWriter
 # Step 3: Hyperparameter defaults (can be overridden via CLI)
 DEFAULT_GAMMA = 0.99
 DEFAULT_ALPHA = 0.2
-DEFAULT_BATCH_SIZE = 64
+DEFAULT_BATCH_SIZE = 256
 DEFAULT_LR_ACTOR = 3e-4
 DEFAULT_LR_CRITIC = 3e-4
 DEFAULT_LR_ALPHA = 3e-4
-DEFAULT_REPLAY_SIZE = 100_000
-DEFAULT_WARMUP_STEPS = 1_000
-DEFAULT_MAX_STEPS = 3_000
-DEFAULT_EVAL_INTERVAL = 5_000
+DEFAULT_REPLAY_SIZE = 1_000_000
+DEFAULT_WARMUP_EPISODES = 10
+DEFAULT_MAX_EPISODES = 100
+DEFAULT_MAX_STEPS_PER_EPISODE = 200
+DEFAULT_EVAL_INTERVAL = 10
 DEFAULT_UPDATES_PER_STEP = 1
 LOG_STD_MIN = -20
 LOG_STD_MAX = 2
@@ -61,12 +61,13 @@ class ReplayBuffer:
 def soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
     """Polyak-averages the parameters of the target network towards the source."""
     for target_param, source_param in zip(target.parameters(), source.parameters()):
-        target_param.data.mul_(1.0 - tau)
-        target_param.data.add_(tau * source_param.data)
+        target_param.data.copy_(tau * source_param.data + (1.0 - tau) * target_param.data)
 
 
 # Step 6: Actor network that outputs a squashed Gaussian policy
 class PolicyNetwork(nn.Module):
+    """Gaussian policy network with tanh squashing for bounded action spaces."""
+    
     def __init__(self, obs_dim: int, act_dim: int, hidden_dim: int, action_scale: np.ndarray):
         super().__init__()
         self.net = nn.Sequential(
@@ -77,10 +78,13 @@ class PolicyNetwork(nn.Module):
         )
         self.mu_layer = nn.Linear(hidden_dim, act_dim)
         self.log_std_layer = nn.Linear(hidden_dim, act_dim)
+        
+        # Store action scaling parameters as buffers (not trainable)
         self.register_buffer("action_scale", torch.tensor(action_scale, dtype=torch.float32))
         self.register_buffer("action_bias", torch.zeros(act_dim, dtype=torch.float32))
 
     def forward(self, state: torch.Tensor):
+        """Returns mean and log_std for the Gaussian distribution."""
         hidden = self.net(state)
         mu = self.mu_layer(hidden)
         log_std = self.log_std_layer(hidden)
@@ -88,34 +92,43 @@ class PolicyNetwork(nn.Module):
         return mu, log_std
 
     def sample(self, state: torch.Tensor):
-        """Samples an action using the reparameterization trick."""
+        """Samples an action using the reparameterization trick.
+        
+        Returns:
+            action: Scaled action for the environment
+            log_prob: Log probability of the action
+            mean_action: Deterministic action (for evaluation)
+        """
         mu, log_std = self.forward(state)
         std = log_std.exp()
+        
+        # Sample from normal distribution
         normal = torch.distributions.Normal(mu, std)
-        noise = normal.rsample()
-        tanh_action = torch.tanh(noise)
-        action = tanh_action * self.action_scale + self.action_bias
-        log_prob = normal.log_prob(noise)
-        log_prob -= torch.log(1.0 - tanh_action.pow(2) + 1e-7)
+        x_t = normal.rsample()  # Reparameterization trick
+        
+        # Apply tanh squashing
+        y_t = torch.tanh(x_t)
+        action = y_t * self.action_scale + self.action_bias
+        
+        # Calculate log probability with change of variables formula
+        log_prob = normal.log_prob(x_t)
+        # Enforcing action bounds (tanh)
+        log_prob -= torch.log(self.action_scale * (1 - y_t.pow(2)) + 1e-6)
         log_prob = log_prob.sum(dim=1, keepdim=True)
-        scale_adjust = torch.log(self.action_scale).sum()
-        log_prob -= scale_adjust
-        deterministic_action = torch.tanh(mu) * self.action_scale + self.action_bias
-        return action, log_prob, deterministic_action
+        
+        # Deterministic action for evaluation
+        mean = torch.tanh(mu) * self.action_scale + self.action_bias
+        
+        return action, log_prob, mean
 
 
-# Step 7: Critic networks for SAC (Twin Q + Value)
-class TwinQNetwork(nn.Module):
+# Step 7: Q-network (critic) for value estimation
+class QNetwork(nn.Module):
+    """Q-network that estimates action-value function."""
+    
     def __init__(self, obs_dim: int, act_dim: int, hidden_dim: int):
         super().__init__()
-        self.q1 = nn.Sequential(
-            nn.Linear(obs_dim + act_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.q2 = nn.Sequential(
+        self.net = nn.Sequential(
             nn.Linear(obs_dim + act_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
@@ -124,200 +137,503 @@ class TwinQNetwork(nn.Module):
         )
 
     def forward(self, state: torch.Tensor, action: torch.Tensor):
+        """Returns Q(s, a)."""
         x = torch.cat([state, action], dim=1)
-        return self.q1(x), self.q2(x)
+        return self.net(x)
 
 
-class ValueNetwork(nn.Module):
-    def __init__(self, obs_dim: int, hidden_dim: int):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-        )
+# Step 8: SAC Agent class that encapsulates all training logic
+class SACAgent:
+    """Soft Actor-Critic agent."""
+    
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        action_scale: np.ndarray,
+        device: torch.device,
+        gamma: float = 0.99,
+        alpha: float = 0.2,
+        auto_alpha: bool = True,
+        lr_actor: float = 3e-4,
+        lr_critic: float = 3e-4,
+        lr_alpha: float = 3e-4,
+        hidden_size: int = 256,
+        tau: float = 5e-3,
+    ):
+        self.device = device
+        self.gamma = gamma
+        self.tau = tau
+        self.auto_alpha = auto_alpha
+        
+        # Initialize networks
+        self.policy_net = PolicyNetwork(obs_dim, act_dim, hidden_size, action_scale).to(device)
+        
+        self.q1_net = QNetwork(obs_dim, act_dim, hidden_size).to(device)
+        self.q2_net = QNetwork(obs_dim, act_dim, hidden_size).to(device)
+        
+        self.q1_target_net = QNetwork(obs_dim, act_dim, hidden_size).to(device)
+        self.q2_target_net = QNetwork(obs_dim, act_dim, hidden_size).to(device)
+        self.q1_target_net.load_state_dict(self.q1_net.state_dict())
+        self.q2_target_net.load_state_dict(self.q2_net.state_dict())
+        
+        # Freeze target networks
+        for param in self.q1_target_net.parameters():
+            param.requires_grad = False
+        for param in self.q2_target_net.parameters():
+            param.requires_grad = False
+        
+        # Initialize optimizers
+        self.actor_optimizer = torch.optim.Adam(self.policy_net.parameters(), lr=lr_actor)
+        self.q1_optimizer = torch.optim.Adam(self.q1_net.parameters(), lr=lr_critic)
+        self.q2_optimizer = torch.optim.Adam(self.q2_net.parameters(), lr=lr_critic)
+        
+        # Entropy temperature
+        if auto_alpha:
+            self.target_entropy = -float(act_dim)
+            self.log_alpha = torch.tensor(np.log(alpha), dtype=torch.float32, 
+                                         device=device, requires_grad=True)
+            self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=lr_alpha)
+        else:
+            self.log_alpha = torch.tensor(np.log(alpha), dtype=torch.float32, device=device)
+            self.alpha_optimizer = None
+            self.target_entropy = None
+    
+    @torch.no_grad()
+    def select_action(self, state: np.ndarray, deterministic: bool = False):
+        """Select action from the policy."""
+        state_v = torch.as_tensor(state, dtype=torch.float32, device=self.device).unsqueeze(0)
+        if deterministic:
+            _, _, action_v = self.policy_net.sample(state_v)
+        else:
+            action_v, _, _ = self.policy_net.sample(state_v)
+        return action_v.squeeze(0).cpu().numpy()
+    
+    def update(self, batch):
+        """Perform one step of gradient descent on the networks."""
+        states, actions, rewards, next_states, dones = batch
+        
+        states_v = torch.as_tensor(states, dtype=torch.float32, device=self.device)
+        actions_v = torch.as_tensor(actions, dtype=torch.float32, device=self.device)
+        rewards_v = torch.as_tensor(rewards, dtype=torch.float32, device=self.device).unsqueeze(1)
+        next_states_v = torch.as_tensor(next_states, dtype=torch.float32, device=self.device)
+        dones_v = torch.as_tensor(dones, dtype=torch.float32, device=self.device).unsqueeze(1)
+        
+        alpha = self.log_alpha.exp().detach()
+        
+        # ============================================================
+        # Update Q-networks (critics)
+        # ============================================================
+        with torch.no_grad():
+            # Sample actions from current policy for next states
+            next_actions_v, next_log_probs_v, _ = self.policy_net.sample(next_states_v)
+            
+            # Compute target Q-values using target networks
+            next_q1_v = self.q1_target_net(next_states_v, next_actions_v)
+            next_q2_v = self.q2_target_net(next_states_v, next_actions_v)
+            next_q_v = torch.min(next_q1_v, next_q2_v)
+            
+            # Target with entropy regularization
+            target_q_v = rewards_v + self.gamma * (1.0 - dones_v) * (
+                next_q_v - alpha * next_log_probs_v
+            )
+        
+        # Current Q estimates
+        q1_v = self.q1_net(states_v, actions_v)
+        q2_v = self.q2_net(states_v, actions_v)
+        
+        # Q-network losses (MSE)
+        q1_loss = F.mse_loss(q1_v, target_q_v)
+        q2_loss = F.mse_loss(q2_v, target_q_v)
+        
+        # Update Q-networks
+        self.q1_optimizer.zero_grad()
+        q1_loss.backward()
+        self.q1_optimizer.step()
+        
+        self.q2_optimizer.zero_grad()
+        q2_loss.backward()
+        self.q2_optimizer.step()
+        
+        # ============================================================
+        # Update policy network (actor)
+        # ============================================================
+        # Sample new actions from current policy
+        new_actions_v, log_probs_v, _ = self.policy_net.sample(states_v)
+        
+        # Compute Q-values for new actions
+        q1_new_v = self.q1_net(states_v, new_actions_v)
+        q2_new_v = self.q2_net(states_v, new_actions_v)
+        min_q_new_v = torch.min(q1_new_v, q2_new_v)
+        
+        # Policy loss: maximize Q - alpha * log_prob
+        policy_loss = (alpha * log_probs_v - min_q_new_v).mean()
+        
+        # Update policy
+        self.actor_optimizer.zero_grad()
+        policy_loss.backward()
+        self.actor_optimizer.step()
+        
+        # ============================================================
+        # Update entropy temperature (alpha)
+        # ============================================================
+        if self.auto_alpha:
+            alpha_loss = -(self.log_alpha * (log_probs_v.detach() + self.target_entropy)).mean()
+            
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
+        else:
+            alpha_loss = torch.tensor(0.0)
+        
+        # ============================================================
+        # Soft update of target networks
+        # ============================================================
+        soft_update(self.q1_target_net, self.q1_net, self.tau)
+        soft_update(self.q2_target_net, self.q2_net, self.tau)
+        
+        # Return losses for logging
+        return {
+            'q1_loss': q1_loss.item(),
+            'q2_loss': q2_loss.item(),
+            'policy_loss': policy_loss.item(),
+            'alpha_loss': alpha_loss.item(),
+            'alpha': alpha.item(),
+            'entropy': -log_probs_v.mean().item(),
+        }
+    
+    def save(self, path: str):
+        """Save agent's networks."""
+        torch.save({
+            'policy_state_dict': self.policy_net.state_dict(),
+            'q1_state_dict': self.q1_net.state_dict(),
+            'q2_state_dict': self.q2_net.state_dict(),
+            'q1_target_state_dict': self.q1_target_net.state_dict(),
+            'q2_target_state_dict': self.q2_target_net.state_dict(),
+            'log_alpha': self.log_alpha,
+        }, path)
+    
+    def load(self, path: str):
+        """Load agent's networks."""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.policy_net.load_state_dict(checkpoint['policy_state_dict'])
+        self.q1_net.load_state_dict(checkpoint['q1_state_dict'])
+        self.q2_net.load_state_dict(checkpoint['q2_state_dict'])
+        self.q1_target_net.load_state_dict(checkpoint['q1_target_state_dict'])
+        self.q2_target_net.load_state_dict(checkpoint['q2_target_state_dict'])
+        self.log_alpha = checkpoint['log_alpha']
 
-    def forward(self, state: torch.Tensor):
-        return self.net(state)
 
-
-# Step 8: Evaluation helper to monitor policy performance
-@torch.no_grad()
-def evaluate_policy(env: gym.Env, policy: PolicyNetwork, device: torch.device, episodes: int = 5) -> float:
-    total_reward = 0.0
+# Step 9: Evaluation helper
+def evaluate_policy(env: gym.Env, agent: SACAgent, episodes: int = 10) -> tuple:
+    """Evaluates the policy using deterministic actions."""
+    episode_rewards = []
+    episode_lengths = []
+    
     for _ in range(episodes):
         obs, _ = env.reset()
+        episode_reward = 0.0
+        episode_length = 0
         done = False
+        
         while not done:
-            obs_v = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-            _, _, action_v = policy.sample(obs_v)
-            action = action_v.squeeze(0).cpu().numpy()
+            action = agent.select_action(obs, deterministic=True)
             next_obs, reward, terminated, truncated, _ = env.step(action)
-            total_reward += reward
+            episode_reward += reward
+            episode_length += 1
             obs = next_obs
             done = terminated or truncated
-    return total_reward / episodes
+        
+        episode_rewards.append(episode_reward)
+        episode_lengths.append(episode_length)
+    
+    return np.mean(episode_rewards), np.std(episode_rewards), np.mean(episode_lengths)
 
 
-# Step 9: Main training routine
+# Step 10: Training function for one episode
+def train_episode(
+    env: gym.Env,
+    agent: SACAgent,
+    replay_buffer: ReplayBuffer,
+    max_steps: int,
+    batch_size: int,
+    updates_per_step: int,
+    warmup: bool = False,
+) -> dict:
+    """Execute one episode and perform training updates.
+    
+    Returns:
+        Dictionary with episode statistics
+    """
+    obs, _ = env.reset()
+    episode_reward = 0.0
+    episode_length = 0
+    done = False
+    
+    # Statistics for this episode
+    total_q1_loss = 0.0
+    total_q2_loss = 0.0
+    total_policy_loss = 0.0
+    total_alpha_loss = 0.0
+    total_alpha = 0.0
+    total_entropy = 0.0
+    update_count = 0
+    
+    while not done and episode_length < max_steps:
+        # Select action
+        if warmup:
+            action = env.action_space.sample()
+        else:
+            action = agent.select_action(obs, deterministic=False)
+        
+        # Execute action
+        next_obs, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
+        
+        # Store transition
+        replay_buffer.push(obs, action, reward, next_obs, done)
+        
+        episode_reward += reward
+        episode_length += 1
+        obs = next_obs
+        
+        # Perform updates (if not in warmup and enough samples)
+        if not warmup and len(replay_buffer) >= batch_size:
+            for _ in range(updates_per_step):
+                batch = replay_buffer.sample(batch_size)
+                losses = agent.update(batch)
+                
+                total_q1_loss += losses['q1_loss']
+                total_q2_loss += losses['q2_loss']
+                total_policy_loss += losses['policy_loss']
+                total_alpha_loss += losses['alpha_loss']
+                total_alpha += losses['alpha']
+                total_entropy += losses['entropy']
+                update_count += 1
+    
+    # Compute average losses
+    stats = {
+        'episode_reward': episode_reward,
+        'episode_length': episode_length,
+    }
+    
+    if update_count > 0:
+        stats.update({
+            'q1_loss': total_q1_loss / update_count,
+            'q2_loss': total_q2_loss / update_count,
+            'policy_loss': total_policy_loss / update_count,
+            'alpha_loss': total_alpha_loss / update_count,
+            'alpha': total_alpha / update_count,
+            'entropy': total_entropy / update_count,
+        })
+    
+    return stats
 
+
+# Step 11: Main training routine
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Train SAC agent on Pendulum-v1 without PTAN")
-    parser.add_argument("--gamma", type=float, default=DEFAULT_GAMMA, help="Discount factor")
-    parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA, help="Initial entropy coefficient (auto-tuned)")
-    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, help="Batch size for updates")
-    parser.add_argument("--lr-actor", type=float, default=DEFAULT_LR_ACTOR, help="Learning rate for the policy")
-    parser.add_argument("--lr-critic", type=float, default=DEFAULT_LR_CRITIC, help="Learning rate for critics")
-    parser.add_argument("--replay-size", type=int, default=DEFAULT_REPLAY_SIZE, help="Replay buffer capacity")
-    parser.add_argument("--lr-alpha", type=float, default=DEFAULT_LR_ALPHA, help="Learning rate for entropy temperature")
-    parser.add_argument("--warmup-steps", type=int, default=DEFAULT_WARMUP_STEPS, help="Steps collected before training")
-    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="Total interaction steps")
-    parser.add_argument("--eval-interval", type=int, default=DEFAULT_EVAL_INTERVAL, help="Steps between evaluations")
-    parser.add_argument("--updates-per-step", type=int, default=DEFAULT_UPDATES_PER_STEP, help="Gradient steps per environment step")
-    parser.add_argument("--hidden-size", type=int, default=256, help="Width of hidden layers")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--logdir", type=str, default="runs_sac_pendulum", help="TensorBoard log directory")
-    parser.add_argument("--tau", type=float, default=5e-3, help="Target network smoothing coefficient")
-    parser.add_argument("--device", type=str, default="cuda:0", help="Torch device, e.g., cpu or cuda")
+    parser = argparse.ArgumentParser(
+        description="Train SAC agent on Pendulum-v1 (episode-based)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("--gamma", type=float, default=DEFAULT_GAMMA, 
+                       help="Discount factor")
+    parser.add_argument("--alpha", type=float, default=DEFAULT_ALPHA, 
+                       help="Initial entropy coefficient")
+    parser.add_argument("--auto-alpha", action="store_true", default=True,
+                       help="Automatically tune entropy coefficient")
+    parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE, 
+                       help="Batch size for updates")
+    parser.add_argument("--lr-actor", type=float, default=DEFAULT_LR_ACTOR, 
+                       help="Learning rate for the policy")
+    parser.add_argument("--lr-critic", type=float, default=DEFAULT_LR_CRITIC, 
+                       help="Learning rate for Q-networks")
+    parser.add_argument("--lr-alpha", type=float, default=DEFAULT_LR_ALPHA, 
+                       help="Learning rate for entropy temperature")
+    parser.add_argument("--replay-size", type=int, default=DEFAULT_REPLAY_SIZE, 
+                       help="Replay buffer capacity")
+    parser.add_argument("--warmup-episodes", type=int, default=DEFAULT_WARMUP_EPISODES, 
+                       help="Random exploration episodes before training")
+    parser.add_argument("--max-episodes", type=int, default=DEFAULT_MAX_EPISODES, 
+                       help="Total number of training episodes")
+    parser.add_argument("--max-steps-per-episode", type=int, default=DEFAULT_MAX_STEPS_PER_EPISODE,
+                       help="Maximum steps per episode")
+    parser.add_argument("--eval-interval", type=int, default=DEFAULT_EVAL_INTERVAL, 
+                       help="Episodes between policy evaluations")
+    parser.add_argument("--eval-episodes", type=int, default=10,
+                       help="Number of episodes for evaluation")
+    parser.add_argument("--updates-per-step", type=int, default=DEFAULT_UPDATES_PER_STEP, 
+                       help="Gradient updates per environment step")
+    parser.add_argument("--hidden-size", type=int, default=256, 
+                       help="Width of hidden layers")
+    parser.add_argument("--seed", type=int, default=42, 
+                       help="Random seed")
+    parser.add_argument("--logdir", type=str, default="runs_sac_pendulum", 
+                       help="TensorBoard log directory")
+    parser.add_argument("--tau", type=float, default=5e-3, 
+                       help="Target network smoothing coefficient")
+    parser.add_argument("--device", type=str, default="auto", 
+                       help="Torch device (cpu, cuda, mps, auto)")
     args = parser.parse_args()
 
-    device = torch.device(args.device)
+    # Determine device
+    if args.device == "auto":
+        if torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            device = torch.device("mps")
+        else:
+            device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
+    
+    print(f"Using device: {device}")
 
-    # Step 10: Set random seeds for reproducibility
+    # Set random seeds
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed(args.seed)
 
-    # Step 11: Prepare training and evaluation environments
+    # Create environments
     env = gym.make("Pendulum-v1")
     eval_env = gym.make("Pendulum-v1")
     env.action_space.seed(args.seed)
     eval_env.action_space.seed(args.seed + 1)
+    
     obs_dim = env.observation_space.shape[0]
     act_dim = env.action_space.shape[0]
     action_scale = env.action_space.high
+    
+    print(f"Observation dim: {obs_dim}, Action dim: {act_dim}")
+    print(f"Action scale: {action_scale}")
 
-    # Step 12: Build networks and optimizers
-    policy_net = PolicyNetwork(obs_dim, act_dim, args.hidden_size, action_scale).to(device)
-    value_net = ValueNetwork(obs_dim, args.hidden_size).to(device)
-    target_value_net = ValueNetwork(obs_dim, args.hidden_size).to(device)
-    target_value_net.load_state_dict(value_net.state_dict())
-    twin_q_net = TwinQNetwork(obs_dim, act_dim, args.hidden_size).to(device)
-    actor_optimizer = torch.optim.Adam(policy_net.parameters(), lr=args.lr_actor)
-    value_optimizer = torch.optim.Adam(value_net.parameters(), lr=args.lr_critic)
-    q_optimizer = torch.optim.Adam(twin_q_net.parameters(), lr=args.lr_critic)
-    log_alpha = torch.tensor(np.log(max(args.alpha, 1e-6)), dtype=torch.float32, device=device, requires_grad=True)
-    alpha_optimizer = torch.optim.Adam([log_alpha], lr=args.lr_alpha)
-    target_entropy = -float(act_dim)
-
-    # Step 13: Initialize replay buffer and logging utilities
+    # Initialize agent
+    agent = SACAgent(
+        obs_dim=obs_dim,
+        act_dim=act_dim,
+        action_scale=action_scale,
+        device=device,
+        gamma=args.gamma,
+        alpha=args.alpha,
+        auto_alpha=args.auto_alpha,
+        lr_actor=args.lr_actor,
+        lr_critic=args.lr_critic,
+        lr_alpha=args.lr_alpha,
+        hidden_size=args.hidden_size,
+        tau=args.tau,
+    )
+    
+    # Initialize replay buffer and logging
     replay_buffer = ReplayBuffer(args.replay_size)
     writer = SummaryWriter(log_dir=args.logdir)
-    best_eval_reward = None
-
-    # Step 14: Main interaction loop with the environment
-    obs, _ = env.reset(seed=args.seed)
-    episode_reward = 0.0
-    episode_steps = 0
+    best_eval_reward = -float('inf')
+    
+    print(f"\nTraining for {args.max_episodes} episodes")
+    print(f"Warmup: {args.warmup_episodes} episodes")
+    print(f"Max steps per episode: {args.max_steps_per_episode}\n")
+    
     start_time = time.time()
-
-    for step_idx in range(1, args.max_steps + 1):
-        obs_v = torch.as_tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
-        if step_idx < args.warmup_steps:
-            action = env.action_space.sample()
-            log_prob = None
-        else:
-            with torch.no_grad():
-                action_v, log_prob_v, _ = policy_net.sample(obs_v)
-            action = action_v.squeeze(0).cpu().numpy()
-            log_prob = log_prob_v.item()
-        next_obs, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
-        replay_buffer.push(obs, action, reward, next_obs, done)
-        episode_reward += reward
-        episode_steps += 1
-
-        # Step 15: Trigger parameter updates once warmup is finished
-        if step_idx >= args.warmup_steps and len(replay_buffer) >= args.batch_size:
-            for _ in range(args.updates_per_step):
-                states, actions, rewards, next_states, dones = replay_buffer.sample(args.batch_size)
-                states_v = torch.as_tensor(states, dtype=torch.float32, device=device)
-                actions_v = torch.as_tensor(actions, dtype=torch.float32, device=device)
-                rewards_v = torch.as_tensor(rewards, dtype=torch.float32, device=device).unsqueeze(1)
-                next_states_v = torch.as_tensor(next_states, dtype=torch.float32, device=device)
-                dones_v = torch.as_tensor(dones.astype(np.float32), dtype=torch.float32, device=device).unsqueeze(1)
-
-                # Step 15a: Update Q-functions using Bellman residual
-                with torch.no_grad():
-                    next_value_v = target_value_net(next_states_v)
-                    target_q_v = rewards_v + args.gamma * (1.0 - dones_v) * next_value_v
-                q1_v, q2_v = twin_q_net(states_v, actions_v)
-                q_loss = F.mse_loss(q1_v, target_q_v) + F.mse_loss(q2_v, target_q_v)
-                q_optimizer.zero_grad()
-                q_loss.backward()
-                q_optimizer.step()
-
-                # Step 15b: Update the state-value network to match the soft value target
-                alpha = log_alpha.exp()
-                alpha_detached = alpha.detach()
-                sampled_actions_v, log_prob_v, _ = policy_net.sample(states_v)
-                q1_pi_v, q2_pi_v = twin_q_net(states_v, sampled_actions_v)
-                min_q_pi_v = torch.min(q1_pi_v, q2_pi_v)
-                soft_value_target = (min_q_pi_v - alpha_detached * log_prob_v).detach()
-                value_v = value_net(states_v)
-                value_loss = F.mse_loss(value_v, soft_value_target)
-                value_optimizer.zero_grad()
-                value_loss.backward()
-                value_optimizer.step()
-
-                # Step 15c: Update the policy to maximize expected Q while respecting entropy
-                policy_loss = (alpha_detached * log_prob_v - min_q_pi_v).mean()
-                actor_optimizer.zero_grad()
-                policy_loss.backward()
-                actor_optimizer.step()
-
-                # Step 15d: Adjust entropy temperature to match target entropy automatically
-                alpha_loss = -(log_alpha * (log_prob_v.detach() + target_entropy)).mean()
-                alpha_optimizer.zero_grad()
-                alpha_loss.backward()
-                alpha_optimizer.step()
-
-                # Step 15e: Keep the target value network in sync
-                soft_update(target_value_net, value_net, args.tau)
-
-            writer.add_scalar("loss/q", q_loss.item(), step_idx)
-            writer.add_scalar("loss/value", value_loss.item(), step_idx)
-            writer.add_scalar("loss/policy", policy_loss.item(), step_idx)
-            writer.add_scalar("loss/alpha", alpha_loss.item(), step_idx)
-            writer.add_scalar("alpha/value", log_alpha.exp().item(), step_idx)
-            if log_prob is not None:
-                writer.add_scalar("policy/log_prob", log_prob, step_idx)
-
-        obs = next_obs
-
-        if done:
-            writer.add_scalar("train/episode_reward", episode_reward, step_idx)
-            writer.add_scalar("train/episode_steps", episode_steps, step_idx)
-            obs, _ = env.reset()
-            episode_reward = 0.0
-            episode_steps = 0
-
-        # Step 16: Periodically evaluate the deterministic policy
-        if step_idx % args.eval_interval == 0:
-            eval_reward = evaluate_policy(eval_env, policy_net, device)
-            writer.add_scalar("eval/average_reward", eval_reward, step_idx)
-            elapsed = time.time() - start_time
-            print(f"Step {step_idx}: eval_reward={eval_reward:.2f}, elapsed={elapsed/60:.1f} min")
-            if best_eval_reward is None or eval_reward > best_eval_reward:
+    total_steps = 0
+    
+    # ============================================================
+    # Main training loop (episode-based)
+    # ============================================================
+    for episode in range(1, args.max_episodes + 1):
+        # Determine if this is a warmup episode
+        warmup = episode <= args.warmup_episodes
+        
+        # Train for one episode
+        stats = train_episode(
+            env=env,
+            agent=agent,
+            replay_buffer=replay_buffer,
+            max_steps=args.max_steps_per_episode,
+            batch_size=args.batch_size,
+            updates_per_step=args.updates_per_step,
+            warmup=warmup,
+        )
+        
+        total_steps += stats['episode_length']
+        
+        # Log training statistics
+        writer.add_scalar("train/episode_reward", stats['episode_reward'], episode)
+        writer.add_scalar("train/episode_length", stats['episode_length'], episode)
+        writer.add_scalar("train/total_steps", total_steps, episode)
+        
+        if not warmup:
+            writer.add_scalar("loss/q1", stats['q1_loss'], episode)
+            writer.add_scalar("loss/q2", stats['q2_loss'], episode)
+            writer.add_scalar("loss/policy", stats['policy_loss'], episode)
+            writer.add_scalar("loss/alpha", stats['alpha_loss'], episode)
+            writer.add_scalar("alpha/value", stats['alpha'], episode)
+            writer.add_scalar("policy/entropy", stats['entropy'], episode)
+        
+        # Print progress
+        if episode % 10 == 0:
+            if warmup:
+                print(f"Episode {episode:4d} [WARMUP] | "
+                      f"Reward: {stats['episode_reward']:7.2f} | "
+                      f"Length: {stats['episode_length']:3d} | "
+                      f"Buffer: {len(replay_buffer):6d}")
+            else:
+                print(f"Episode {episode:4d} | "
+                      f"Reward: {stats['episode_reward']:7.2f} | "
+                      f"Length: {stats['episode_length']:3d} | "
+                      f"Q_loss: {stats['q1_loss']:6.3f} | "
+                      f"Alpha: {stats['alpha']:.3f}")
+        
+        # Periodic evaluation
+        if episode % args.eval_interval == 0:
+            eval_reward, eval_std, eval_length = evaluate_policy(
+                eval_env, agent, episodes=args.eval_episodes
+            )
+            
+            writer.add_scalar("eval/mean_reward", eval_reward, episode)
+            writer.add_scalar("eval/std_reward", eval_std, episode)
+            writer.add_scalar("eval/mean_length", eval_length, episode)
+            
+            elapsed_min = (time.time() - start_time) / 60.0
+            print(f"\n{'='*70}")
+            print(f"Evaluation at episode {episode} (total steps: {total_steps})")
+            print(f"Mean reward: {eval_reward:.2f} ± {eval_std:.2f}")
+            print(f"Mean length: {eval_length:.1f}")
+            print(f"Best reward: {best_eval_reward:.2f}")
+            print(f"Elapsed time: {elapsed_min:.1f} minutes")
+            print(f"{'='*70}\n")
+            
+            # Save best model
+            if eval_reward > best_eval_reward:
                 best_eval_reward = eval_reward
                 os.makedirs("saves", exist_ok=True)
-                torch.save(policy_net.state_dict(), os.path.join("saves", "sac_pendulum_best.pt"))
-
-    # Step 17: Finish up with a final log entry
-    writer.add_scalar("train/total_time_minutes", (time.time() - start_time) / 60.0, args.max_steps)
+                save_path = os.path.join("saves", "sac_pendulum_best.pth")
+                agent.save(save_path)
+                print(f"✓ Saved new best model (reward: {eval_reward:.2f})\n")
+    
+    # Final evaluation
+    print(f"\n{'='*70}")
+    print("Training completed!")
+    final_reward, final_std, final_length = evaluate_policy(
+        eval_env, agent, episodes=20
+    )
+    print(f"Final evaluation (20 episodes):")
+    print(f"  Mean reward: {final_reward:.2f} ± {final_std:.2f}")
+    print(f"  Mean length: {final_length:.1f}")
+    print(f"Best evaluation reward: {best_eval_reward:.2f}")
+    print(f"Total steps: {total_steps}")
+    print(f"Total time: {(time.time() - start_time) / 60.0:.1f} minutes")
+    print(f"{'='*70}\n")
+    
+    # Save final model
+    final_save_path = os.path.join("saves", "sac_pendulum_final.pth")
+    agent.save(final_save_path)
+    print(f"Saved final model to {final_save_path}")
+    
+    writer.add_scalar("eval/final_reward", final_reward, args.max_episodes)
     writer.close()
+    env.close()
+    eval_env.close()
 
 
 if __name__ == "__main__":
